@@ -88,8 +88,8 @@ Usage: $0 -bssid AA:BB:CC:DD:EE:FF [-ssid "MyWiFi"] [-i IFACE] [-stopfile GLOB]
 Options:
   -bssid     Target AP BSSID (MAC), e.g., AA:BB:CC:DD:EE:FF
   -ssid      Target AP SSID (ESSID), e.g., MyWiFi
-  -i         Monitor-capable interface. Defaults to:
-             wlxa047d762e822, else wlxa0d768301df8, else wlp3s0
+  -i         Monitor-capable interface. Defaults to first available of:
+             ${DEFAULT_IFACES[*]}
   -stopfile  A file path or wildcard (e.g., /path/start*end.txt). If any match
              exists (checked every 5s), the program exits cleanly.
   -h         Show this help
