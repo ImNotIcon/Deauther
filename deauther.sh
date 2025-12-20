@@ -35,7 +35,7 @@ set -euo pipefail
 MAIN_PID="$$"
 
 # ----------------------- Defaults / Globals -----------------------
-DEFAULT_IFACES=( "wlxa047d762e822" "wlxa0d768301df8" "wlp3s0" )
+DEFAULT_IFACES=( "wlan0" "wlan1" "wlan0mon" )
 INTERFACE=""
 TARGET_BSSID=""
 TARGET_SSID=""
