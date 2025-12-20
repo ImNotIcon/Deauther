@@ -78,7 +78,6 @@ SCANS_OK=0
 SCANS_IGNORED=0
 SCANS_FAIL=0
 START_TS="$(date +%s)"
-LAST_CH_SWITCH_TS="$START_TS"
 
 # ----------------------------- Helpers ----------------------------
 usage() {
@@ -148,7 +147,9 @@ kill_group_strong() {
     kill -TERM "$pid" 2>/dev/null || true; sleep 0.05
     kill -KILL "$pid" 2>/dev/null || true
   fi
-  [[ -n "$broom" ]] && pkill -9 -f "$broom" 2>/dev/null || true
+  if [[ -n "$broom" ]]; then
+    pkill -9 -f "$broom" 2>/dev/null || true
+  fi
 }
 
 kill_pid_only() {
@@ -170,13 +171,17 @@ cleanup_once() {
   kill_group_strong "$DEAUTH_PGID"     "$DEAUTH_PID"     "aireplay-ng .* ${INTERFACE:-}"
   kill_group_strong "$SCAN_PGID"       "$SCAN_PID"       "airodump-ng .* -w ${CSV_PREFIX:-/tmp/nowhere}"
   pkill -9 -P "$MAIN_PID" 2>/dev/null || true
-  [[ -n "${INSTANCE_DIR}" ]] && rm -rf "$INSTANCE_DIR" 2>/dev/null || true
+  if [[ -n "${INSTANCE_DIR}" ]]; then
+    rm -rf "$INSTANCE_DIR" 2>/dev/null || true
+  fi
 }
 
 cleanup_and_exit() {
   local why="${1:-}"
   cleanup_once
-  [[ "$why" != "EXIT" ]] && exit 0 || true
+  if [[ "$why" != "EXIT" ]]; then
+    exit 0
+  fi
 }
 
 # ----- Uptime pretty printer (years, weeks, days, hours, minutes, seconds) -----
@@ -251,7 +256,16 @@ start_title_updater() {
 }
 
 # ---------------------- CSV parsing helpers ----------------------
-latest_csv() { ls -1t "${CSV_PREFIX}-"*.csv 2>/dev/null | head -n1 || true; }
+latest_csv() {
+  local files=()
+  shopt -s nullglob
+  files=( "${CSV_PREFIX}-"*.csv )
+  shopt -u nullglob
+  (( ${#files[@]} == 0 )) && return 0
+  local newest
+  newest="$(stat -c '%Y %n' "${files[@]}" 2>/dev/null | sort -nr | head -n1 | cut -d' ' -f2-)"
+  [[ -n "$newest" ]] && echo "$newest"
+}
 clean_csv()  { rm -f "${CSV_PREFIX}-"*.csv 2>/dev/null || true; }
 
 parse_csv_for_ap() {
@@ -419,7 +433,6 @@ start_deauth() {
 
   CURRENT_CH="$ch"
   CURRENT_BSSID="$bssid"
-  LAST_CH_SWITCH_TS="$(date +%s)"
   echo "[*] Deauth started on ch $CURRENT_CH for $CURRENT_BSSID"
   write_status
 }
@@ -462,7 +475,7 @@ else
 fi
 
 # Now create instance dir and files
-INSTANCE_DIR="$(mktemp -d /tmp/deauther.$(date +%s).$$.XXXXXX)"
+INSTANCE_DIR="$(mktemp -d "/tmp/deauther.${START_TS}.$$.XXXXXX")"
 CSV_PREFIX="${INSTANCE_DIR}/scan"
 DEAUTH_LOG="${INSTANCE_DIR}/aireplay.log"
 TOT_DEAUTH_COUNT_FILE="${INSTANCE_DIR}/deauth.total"
