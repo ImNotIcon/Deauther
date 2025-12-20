@@ -151,17 +151,26 @@ kill_group_strong() {
   [[ -n "$broom" ]] && pkill -9 -f "$broom" 2>/dev/null || true
 }
 
+kill_pid_only() {
+  # args: pid (do NOT signal the process group)
+  local pid="$1"
+  [[ -z "$pid" ]] && return 0
+  kill -INT  "$pid" 2>/dev/null || true; sleep 0.05
+  kill -TERM "$pid" 2>/dev/null || true; sleep 0.05
+  kill -KILL "$pid" 2>/dev/null || true
+}
+
 cleanup_once() {
   [[ "${_CLEANED_ONCE}" -eq 1 ]] && return 0
   _CLEANED_ONCE=1
   echo "[*] Cleaning up and exiting..."
+  [[ -n "$TITLE_PID"      ]] && kill_pid_only "$TITLE_PID"
+  [[ -n "$STOP_WATCH_PID" ]] && kill_pid_only "$STOP_WATCH_PID"
   kill_group_strong "$DEAUTH_MON_PGID" "$DEAUTH_MON_PID" "tail -F ${DEAUTH_LOG:-/dev/null}"
   kill_group_strong "$DEAUTH_PGID"     "$DEAUTH_PID"     "aireplay-ng .* ${INTERFACE:-}"
   kill_group_strong "$SCAN_PGID"       "$SCAN_PID"       "airodump-ng .* -w ${CSV_PREFIX:-/tmp/nowhere}"
   pkill -9 -P "$MAIN_PID" 2>/dev/null || true
   [[ -n "${INSTANCE_DIR}" ]] && rm -rf "$INSTANCE_DIR" 2>/dev/null || true
-  [[ -n "$TITLE_PID"      ]] && kill_group_strong "" "$TITLE_PID"
-  [[ -n "$STOP_WATCH_PID" ]] && kill_group_strong "" "$STOP_WATCH_PID"
 }
 
 cleanup_and_exit() {
