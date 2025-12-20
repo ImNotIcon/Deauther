@@ -88,27 +88,3 @@ MIT License. See `LICENSE`.
 
 ## Contributing
 See `CONTRIBUTING.md` for guidelines. Bug reports and small fixes are welcome.
-
-## Install (run as `deauther` from any directory)
-Pick one of these:
-
-### System-wide (recommended)
-```bash
-chmod +x deauther.sh
-sudo install -m 755 deauther.sh /usr/local/bin/deauther
-```
-
-### User-only (no sudo for install)
-```bash
-chmod +x deauther.sh
-mkdir -p ~/.local/bin
-ln -sf "$(pwd)/deauther.sh" ~/.local/bin/deauther
-```
-Ensure `~/.local/bin` is in your `PATH`. Note: running `airodump-ng`/`aireplay-ng` typically still requires `sudo` or elevated privileges, even if the script is installed per-user.
-
-## Usage
-```bash
-deauther -bssid AA:BB:CC:DD:EE:FF -i wlan1
-deauther -ssid "MyWiFi"
-deauther -ssid "MyWiFi" -stopfile "/tmp/stop*now.txt"
-```
