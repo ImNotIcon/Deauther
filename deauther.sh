@@ -479,13 +479,13 @@ start_client_deauth_loop() {
         run_client_once "$c" "$ifc" "$bssid" "$deauth_count" "$cmd_timeout"
       done
 
+      if (( round_has_clients == 1 )); then
+        log "Round end"
+      fi
       round_end="$(date +%s)"
       elapsed=$((round_end - round_start))
       if (( elapsed < round_secs )); then
         sleep $((round_secs - elapsed))
-      fi
-      if (( round_has_clients == 1 )); then
-        log "Round end"
       fi
     done
   ' -- "$ifc" "$bssid" "$CLIENTS_FILE" "$CLIENT_DEAUTH_COUNT" "$CLIENT_ROUND_SECS" "$CLIENT_CMD_TIMEOUT" &
