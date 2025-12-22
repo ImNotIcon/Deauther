@@ -34,8 +34,18 @@ set -Eeuo pipefail
 
 MAIN_PID="$$"
 
+# Load config from .env (bash syntax)
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ENV_FILE="${ENV_FILE:-${SCRIPT_DIR}/.env}"
+if [[ -f "$ENV_FILE" ]]; then
+  # shellcheck source=/dev/null
+  source "$ENV_FILE"
+fi
+
 # ----------------------- Defaults / Globals -----------------------
-DEFAULT_IFACES=( "wlan0" "wlan1" "wlan0mon" )
+if ! declare -p DEFAULT_IFACES >/dev/null 2>&1; then
+  DEFAULT_IFACES=( "wlan0" "wlan1" "wlan0mon" )
+fi
 INTERFACE=""
 TARGET_BSSID=""
 TARGET_SSID=""
@@ -51,12 +61,12 @@ CH_DEAUTH_COUNT_FILE=""
 STATUS_FILE=""
 CLIENTS_FILE=""
 
-SCAN_TIMEOUT=20      # seconds (full scan)
-QUICK_CONFIRM=5      # seconds (if we have a channel hint)
-SLEEP_BETWEEN=0.5
-CLIENT_ROUND_SECS=10
-CLIENT_CMD_TIMEOUT=10
-CLIENT_DEAUTH_COUNT=5
+SCAN_TIMEOUT="${SCAN_TIMEOUT:-20}"          # seconds (full scan)
+QUICK_CONFIRM="${QUICK_CONFIRM:-5}"         # seconds (if we have a channel hint)
+SLEEP_BETWEEN="${SLEEP_BETWEEN:-0.5}"
+CLIENT_ROUND_SECS="${CLIENT_ROUND_SECS:-10}"
+CLIENT_CMD_TIMEOUT="${CLIENT_CMD_TIMEOUT:-10}"
+CLIENT_DEAUTH_COUNT="${CLIENT_DEAUTH_COUNT:-5}"
 
 # PIDs / PGIDs
 DEAUTH_PGID=""
