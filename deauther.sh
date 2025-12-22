@@ -470,7 +470,9 @@ start_client_deauth_loop() {
         done < "$clients_file"
       fi
 
+      round_has_clients=0
       if (( ${#clients[@]} > 0 )); then
+        round_has_clients=1
         log "Round start: ${#clients[@]} client(s)"
       fi
       for c in "${clients[@]}"; do
@@ -482,7 +484,9 @@ start_client_deauth_loop() {
       if (( elapsed < round_secs )); then
         sleep $((round_secs - elapsed))
       fi
-      log "Round end"
+      if (( round_has_clients == 1 )); then
+        log "Round end"
+      fi
     done
   ' -- "$ifc" "$bssid" "$CLIENTS_FILE" "$CLIENT_DEAUTH_COUNT" "$CLIENT_ROUND_SECS" "$CLIENT_CMD_TIMEOUT" &
   CLIENT_LOOP_PID="$!"
