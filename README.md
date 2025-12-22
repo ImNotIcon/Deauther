@@ -16,6 +16,11 @@ Pick one of these:
 chmod +x deauther.sh
 sudo install -m 755 deauther.sh /usr/local/bin/deauther
 ```
+Alternative system install script (also handy after updates):
+```bash
+chmod +x install.sh
+./install.sh
+```
 
 ### User-only (no sudo for install)
 ```bash
