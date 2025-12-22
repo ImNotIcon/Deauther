@@ -55,7 +55,7 @@ SCAN_TIMEOUT=20      # seconds (full scan)
 QUICK_CONFIRM=5      # seconds (if we have a channel hint)
 SLEEP_BETWEEN=0.5
 CLIENT_ROUND_SECS=10
-CLIENT_CMD_TIMEOUT=5
+CLIENT_CMD_TIMEOUT=10
 CLIENT_DEAUTH_COUNT=5
 
 # PIDs / PGIDs
