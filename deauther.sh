@@ -458,6 +458,7 @@ start_client_deauth_loop() {
       kill -INT  "$killer" 2>/dev/null || true
       kill -TERM "$killer" 2>/dev/null || true
       kill -KILL "$killer" 2>/dev/null || true
+      log "Deauth end: ${client}"
     }
 
     while true; do
@@ -481,6 +482,7 @@ start_client_deauth_loop() {
       if (( elapsed < round_secs )); then
         sleep $((round_secs - elapsed))
       fi
+      log "Round end"
     done
   ' -- "$ifc" "$bssid" "$CLIENTS_FILE" "$CLIENT_DEAUTH_COUNT" "$CLIENT_ROUND_SECS" "$CLIENT_CMD_TIMEOUT" &
   CLIENT_LOOP_PID="$!"
