@@ -30,7 +30,7 @@
 #
 # Requires: bash, iw, airodump-ng, aireplay-ng, awk, ps, setsid, pkill, grep, stdbuf
 
-set -euo pipefail
+set -Eeuo pipefail
 
 MAIN_PID="$$"
 
@@ -78,6 +78,7 @@ UNKNOWN_CH_STREAK=0
 
 # Guard
 _CLEANED_ONCE=0
+EXIT_REASON=""
 
 # Stats / timings
 SCANS_OK=0
@@ -86,6 +87,31 @@ SCANS_FAIL=0
 START_TS="$(date +%s)"
 
 # ----------------------------- Helpers ----------------------------
+log_err() {
+  local msg="$1"
+  printf '[EXIT] %s\n' "$msg" >&2
+}
+
+on_err() {
+  local line="$1" cmd="$2" status="$3"
+  log_err "ERR (status=${status}) at line ${line}: ${cmd}"
+  EXIT_REASON="ERR"
+  cleanup_once
+  exit "$status"
+}
+
+on_int()  { log_err "INT received";  cleanup_and_exit "INT"; }
+on_term() { log_err "TERM received"; cleanup_and_exit "TERM"; }
+on_exit() {
+  local status="$1"
+  if [[ -z "$EXIT_REASON" ]]; then
+    log_err "EXIT (status=${status})"
+  else
+    log_err "EXIT (${EXIT_REASON}, status=${status})"
+  fi
+  cleanup_once
+}
+
 usage() {
   cat <<EOF
 Usage: $0 -bssid AA:BB:CC:DD:EE:FF [-ssid "MyWiFi"] [-i IFACE] [-stopfile GLOB]
@@ -187,6 +213,9 @@ cleanup_once() {
 
 cleanup_and_exit() {
   local why="${1:-}"
+  if [[ -n "$why" ]]; then
+    EXIT_REASON="$why"
+  fi
   cleanup_once
   if [[ "$why" != "EXIT" ]]; then
     exit 0
@@ -625,9 +654,10 @@ echo "[INIT] Target SSID : ${TARGET_SSID:-<none>}"
 
 need_cmd iw; need_cmd airodump-ng; need_cmd aireplay-ng; need_cmd awk; need_cmd setsid; need_cmd pkill; need_cmd ps; need_cmd grep; need_cmd stdbuf
 
-trap 'cleanup_and_exit INT'  INT
-trap 'cleanup_and_exit TERM' TERM
-trap 'cleanup_and_exit EXIT' EXIT
+trap 'on_err "$LINENO" "$BASH_COMMAND" "$?"' ERR
+trap 'on_int'  INT
+trap 'on_term' TERM
+trap 'on_exit "$?"' EXIT
 
 start_stop_watcher
 start_title_updater
