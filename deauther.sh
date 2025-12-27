@@ -749,10 +749,10 @@ while true; do
       fi
     fi
     csv_file="$(latest_csv || true)"
+    if [[ -n "$csv_file" && -n "$KNOWN_BSSID" ]]; then
+      merge_clients_from_csv "$csv_file" "$KNOWN_BSSID" "$CLIENTS_PENDING_FILE"
+    fi
     if (( restart_deauth == 1 )); then
-      if [[ -n "$csv_file" && -n "$KNOWN_BSSID" ]]; then
-        merge_clients_from_csv "$csv_file" "$KNOWN_BSSID" "$CLIENTS_PENDING_FILE"
-      fi
       start_deauth "$INTERFACE" "$KNOWN_BSSID" "$KNOWN_CH" || true
     fi
     write_status
